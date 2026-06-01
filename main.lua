@@ -2,14 +2,15 @@ local Players = game:GetService("Players")
 local ContextActionService = game:GetService("ContextActionService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local UserGameSettings = UserSettings():GetService("UserGameSettings")
 
 local Player = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
-local KEY = Enum.KeyCode.E
+local KEY = Enum.KeyCode.T
 local MAX_DIST = 1200
-local LOCK_FOV = 65
-local CAM_OFFSET = Vector3.new(4, 1.5, 18)
+local LOCK_FOV = 75
+local CAM_OFFSET = Vector3.new(3, 1, 22)
 local ICON = "rbxassetid://263401222"
 local MAX_ANGLE = math.rad(80)
 
@@ -19,10 +20,15 @@ local cloneUI = nil
 local humConn = nil
 local tHumConn = nil
 local unlockTween = nil
+local fovTween = nil
 local oldAutoRotate = nil
 local oldMouseLock = nil
+local oldRotationType = nil
+local oldFOV = nil
 local smoothCamPos = nil
+local smoothLookDir = nil
 local renderConn = nil
+local rotConn = nil
 
 local char = Player.Character or Player.CharacterAdded:Wait()
 local hum = char:WaitForChild("Humanoid")
@@ -91,13 +97,22 @@ local function createIndicator(targetHead)
 	cloneUI = gui
 end
 
-local function stopLock()
-	if not locked and not unlockTween then return end
+local function cleanupConnections()
 	if renderConn then renderConn:Disconnect(); renderConn = nil end
-	if cloneUI then cloneUI:Destroy(); cloneUI = nil end
+	if rotConn then rotConn:Disconnect(); rotConn = nil end
 	if humConn then humConn:Disconnect(); humConn = nil end
 	if tHumConn then tHumConn:Disconnect(); tHumConn = nil end
+	if fovTween then fovTween:Cancel(); fovTween = nil end
+end
+
+local function stopLock()
+	if not locked and not unlockTween then return end
+
+	cleanupConnections()
+
+	if cloneUI then cloneUI:Destroy(); cloneUI = nil end
 	if unlockTween then unlockTween:Cancel(); unlockTween = nil end
+
 	if hum and oldAutoRotate ~= nil then
 		hum.AutoRotate = oldAutoRotate
 		oldAutoRotate = nil
@@ -106,15 +121,28 @@ local function stopLock()
 		Player.DevEnableMouseLock = oldMouseLock
 		oldMouseLock = nil
 	end
+	if oldRotationType ~= nil then
+		UserGameSettings.RotationType = oldRotationType
+		oldRotationType = nil
+	end
+
+	local restoreFOV = oldFOV or 70
+	oldFOV = nil
+
 	locked = false
 	target = nil
 	smoothCamPos = nil
+	smoothLookDir = nil
 	refreshButton()
 
 	local currentRoot = char and char:FindFirstChild("HumanoidRootPart")
 	if currentRoot and currentRoot.Parent then
-		local behind = CFrame.new(currentRoot.CFrame * Vector3.new(0, 3, 14), currentRoot.Position + Vector3.new(0, 2, 0))
-		unlockTween = TweenService:Create(Camera, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {CFrame = behind, FieldOfView = 70})
+		local behindCF = currentRoot.CFrame * CFrame.new(0, 3, 14)
+		local lookAt = currentRoot.Position + Vector3.new(0, 2, 0)
+		unlockTween = TweenService:Create(Camera, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			CFrame = CFrame.new(behindCF.Position, lookAt),
+			FieldOfView = restoreFOV
+		})
 		local conn; conn = unlockTween.Completed:Connect(function()
 			conn:Disconnect()
 			unlockTween = nil
@@ -122,17 +150,20 @@ local function stopLock()
 		end)
 		unlockTween:Play()
 	else
-		Camera.FieldOfView = 70
+		Camera.FieldOfView = restoreFOV
 		Camera.CameraType = Enum.CameraType.Custom
 	end
 end
 
 local function startLock(targetHead)
+	cleanupConnections()
 	if unlockTween then unlockTween:Cancel(); unlockTween = nil end
 
 	target = targetHead
 	locked = true
 	smoothCamPos = Camera.CFrame.Position
+	oldFOV = Camera.FieldOfView
+
 	createIndicator(targetHead)
 	refreshButton()
 
@@ -149,27 +180,61 @@ local function startLock(targetHead)
 	oldMouseLock = Player.DevEnableMouseLock
 	Player.DevEnableMouseLock = false
 
+	oldRotationType = UserGameSettings.RotationType
+	UserGameSettings.RotationType = Enum.RotationType.MovementRelative
+
 	Camera.CameraType = Enum.CameraType.Scriptable
-	Camera.FieldOfView = LOCK_FOV
+
+	fovTween = TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {FieldOfView = LOCK_FOV})
+	fovTween:Play()
+
+	local initRoot = char and char:FindFirstChild("HumanoidRootPart")
+	if initRoot then
+		local lv = initRoot.CFrame.LookVector
+		local flat = Vector3.new(lv.X, 0, lv.Z)
+		smoothLookDir = flat.Magnitude > 0.001 and flat.Unit or Vector3.new(0, 0, -1)
+	else
+		smoothLookDir = Vector3.new(0, 0, -1)
+	end
+
+	rotConn = RunService.Heartbeat:Connect(function(dt)
+		if not locked or not target or not target.Parent then return end
+		local currentRoot = char and char:FindFirstChild("HumanoidRootPart")
+		if not currentRoot or not smoothLookDir then return end
+
+		local targetPos = target.Position
+		local rootPos = currentRoot.Position
+		local targetDir = Vector3.new(targetPos.X - rootPos.X, 0, targetPos.Z - rootPos.Z)
+		if targetDir.Magnitude <= 0.001 then return end
+
+		targetDir = targetDir.Unit
+		local newDir = smoothLookDir:Lerp(targetDir, 1 - math.exp(-15 * dt))
+		smoothLookDir = newDir.Magnitude > 0.001 and newDir.Unit or targetDir
+		currentRoot.CFrame = CFrame.new(rootPos, rootPos + smoothLookDir)
+	end)
 
 	renderConn = RunService.RenderStepped:Connect(function(dt)
+		if not locked then return end
 		if not target or not target.Parent then stopLock(); return end
 		if not char or not char.Parent then stopLock(); return end
 
 		local currentRoot = char:FindFirstChild("HumanoidRootPart")
-		local myHead = char:FindFirstChild("Head")
-		if not currentRoot or not myHead then stopLock(); return end
+		if not currentRoot or not smoothCamPos then stopLock(); return end
 
-		local targetPos = target.Position
 		local rootPos = currentRoot.Position
-
-		currentRoot.CFrame = CFrame.new(rootPos, Vector3.new(targetPos.X, rootPos.Y, targetPos.Z))
+		local targetPos = target.Position
 
 		local basePos = currentRoot.CFrame * Vector3.new(CAM_OFFSET.X, 0, CAM_OFFSET.Z)
-		local goalPos = Vector3.new(basePos.X, myHead.Position.Y + CAM_OFFSET.Y, basePos.Z)
+		local stableY = rootPos.Y + hum.HipHeight + CAM_OFFSET.Y
 
-		local alpha = 1 - math.exp(-18 * dt)
-		smoothCamPos = smoothCamPos:Lerp(goalPos, alpha)
+		local xzAlpha = 1 - math.exp(-10 * dt)
+		local yAlpha = 1 - math.exp(-6 * dt)
+
+		smoothCamPos = Vector3.new(
+			smoothCamPos.X + (basePos.X - smoothCamPos.X) * xzAlpha,
+			smoothCamPos.Y + (stableY   - smoothCamPos.Y) * yAlpha,
+			smoothCamPos.Z + (basePos.Z - smoothCamPos.Z) * xzAlpha
+		)
 
 		Camera.CFrame = CFrame.new(smoothCamPos, targetPos)
 	end)
@@ -230,10 +295,8 @@ end
 
 local function tryLock()
 	if locked then stopLock(); return end
-
 	local targetHead = getBestTarget()
 	if not targetHead then return end
-
 	startLock(targetHead)
 end
 
@@ -257,10 +320,34 @@ btn.InputEnded:Connect(function(input)
 end)
 
 Player.CharacterAdded:Connect(function(c)
+	cleanupConnections()
+	if unlockTween then unlockTween:Cancel(); unlockTween = nil end
+	if fovTween then fovTween:Cancel(); fovTween = nil end
+	if cloneUI then cloneUI:Destroy(); cloneUI = nil end
+
+	if oldRotationType ~= nil then
+		UserGameSettings.RotationType = oldRotationType
+		oldRotationType = nil
+	end
+	if oldMouseLock ~= nil then
+		Player.DevEnableMouseLock = oldMouseLock
+		oldMouseLock = nil
+	end
+	oldAutoRotate = nil
+
+	Camera.FieldOfView = oldFOV or 70
+	oldFOV = nil
+	Camera.CameraType = Enum.CameraType.Custom
+
+	locked = false
+	target = nil
+	smoothCamPos = nil
+	smoothLookDir = nil
+
 	char = c
 	hum = c:WaitForChild("Humanoid")
 	root = c:WaitForChild("HumanoidRootPart")
-	stopLock()
+	refreshButton()
 end)
 
 Player.CharacterRemoving:Connect(function()
